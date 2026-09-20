@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+import time
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 from urllib.parse import quote_plus
 
@@ -73,6 +76,7 @@ SCHEMA_STATEMENTS = [
         message TEXT
     )
     """,
+    "ALTER TABLE job_runs ADD COLUMN IF NOT EXISTS runtime_seconds DOUBLE PRECISION",
     """
     CREATE TABLE IF NOT EXISTS account_snapshots (
         snapshot_at TIMESTAMPTZ PRIMARY KEY,
@@ -276,13 +280,29 @@ class FetchResult:
 
 
 class GW2Api:
+    """Thread-safe GW2 API client with connection reuse per worker thread."""
+
     def __init__(self, api_key: str | None = None):
-        self.session = requests.Session()
-        key = api_key or os.environ["GW2_API_KEY"]
-        self.session.headers.update({"Authorization": f"Bearer {key}", "User-Agent": "gw2-cloud-tracker/1.0"})
+        self.api_key = api_key or os.environ["GW2_API_KEY"]
+        self._local = threading.local()
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update({
+                "Authorization": f"Bearer {self.api_key}",
+                "User-Agent": "gw2-cloud-tracker/1.1",
+            })
+            self._local.session = session
+        return session
 
     def get(self, path: str, **params: Any) -> Any:
-        r = self.session.get(f"{GW2_API}{path}", params=params or None, timeout=30)
+        r = self._session().get(
+            f"{GW2_API}{path}",
+            params=params or None,
+            timeout=(5, 15),
+        )
         r.raise_for_status()
         return r.json()
 
@@ -302,7 +322,9 @@ class GW2Api:
             p = dict(params)
             p["page"] = page
             p["page_size"] = 200
-            r = self.session.get(f"{GW2_API}{path}", params=p, timeout=30)
+            r = self._session().get(
+                f"{GW2_API}{path}", params=p, timeout=(5, 15)
+            )
             if r.status_code == 404:
                 break
             r.raise_for_status()
@@ -316,52 +338,93 @@ class GW2Api:
             page += 1
         return rows
 
+    def paginated_until_known(
+        self, path: str, known_ids: set[int], **params: Any
+    ) -> list[dict[str, Any]]:
+        """Fetch newest-first pages and stop once an already-stored transaction is seen."""
+        if not known_ids:
+            return self.paginated(path, **params)
+
+        rows: list[dict[str, Any]] = []
+        page = 0
+        while True:
+            p = dict(params)
+            p["page"] = page
+            p["page_size"] = 200
+            r = self._session().get(
+                f"{GW2_API}{path}", params=p, timeout=(5, 15)
+            )
+            if r.status_code == 404:
+                break
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                break
+            rows.extend(data)
+            if any(
+                isinstance(row, dict)
+                and row.get("id") is not None
+                and int(row["id"]) in known_ids
+                for row in data
+            ):
+                break
+            total_pages = int(r.headers.get("X-Page-Total", 1))
+            if page >= total_pages - 1:
+                break
+            page += 1
+        return rows
+
     def prices(self, item_ids: Iterable[int]) -> dict[int, dict[str, Any]]:
         unique = sorted({int(i) for i in item_ids if i})
-        out: dict[int, dict[str, Any]] = {}
-        for i in range(0, len(unique), BATCH_SIZE):
-            chunk = unique[i:i + BATCH_SIZE]
-            if not chunk:
-                continue
+        chunks = [unique[i:i + BATCH_SIZE] for i in range(0, len(unique), BATCH_SIZE)]
+        if not chunks:
+            return {}
+
+        def fetch_chunk(chunk: list[int]) -> list[dict[str, Any]]:
             try:
-                rows = self.get("/commerce/prices", ids=",".join(map(str, chunk)))
-            except requests.HTTPError:
-                continue
-            for row in rows:
-                out[int(row["id"])] = row
+                return self.get("/commerce/prices", ids=",".join(map(str, chunk)))
+            except Exception:
+                return []
+
+        out: dict[int, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as pool:
+            futures = [pool.submit(fetch_chunk, chunk) for chunk in chunks]
+            for future in as_completed(futures):
+                for row in future.result():
+                    out[int(row["id"])] = row
         return out
 
 
-# Endpoints where a compact current-state/change history is valuable.
-GENERIC_ACCOUNT_ENDPOINTS = [
-    "/account/buildstorage",
+# The GitHub Action runs once per day. Slow-changing endpoints are refreshed
+# conditionally inside that same daily run; there are no extra weekly/monthly jobs.
+MAX_API_WORKERS = 8
+UNLOCK_REFRESH_DAYS = 7
+CHARACTER_DETAIL_REFRESH_DAYS = 30
+CURRENCY_METADATA_REFRESH_DAYS = 30
+TOKENINFO_REFRESH_DAYS = 3650
+
+DAILY_STATE_ENDPOINTS = [
     "/account/dailycrafting",
     "/account/dungeons",
-    "/account/emotes",
-    "/account/finishers",
-    "/account/gliders",
-    "/account/home/cats",
-    "/account/home/nodes",
-    "/account/homestead/decorations",
-    "/account/homestead/glyphs",
-    "/account/jadebots",
-    "/account/mailcarriers",
     "/account/mapchests",
-    "/account/masteries",
-    "/account/mounts/types",
-    "/account/novelties",
     "/account/progression",
-    "/account/pvp/heroes",
     "/account/raids",
-    "/account/skiffs",
     "/account/wizardsvault/daily",
-    "/account/wizardsvault/listings",
     "/account/wizardsvault/special",
     "/account/wizardsvault/weekly",
     "/account/worldbosses",
     "/account/wvw",
     "/pvp/standings",
 ]
+
+WEEKLY_STATE_ENDPOINTS = [
+    "/account/buildstorage",
+    "/account/homestead/decorations",
+    "/account/homestead/glyphs",
+    "/account/masteries",
+    "/account/wizardsvault/listings",
+]
+
 
 UNLOCK_ENDPOINTS = {
     "dyes": "/account/dyes",
@@ -415,6 +478,43 @@ def record_error(engine: Engine, snapshot_at: datetime, result: FetchResult) -> 
             INSERT INTO endpoint_errors(snapshot_at, endpoint, status_code, error)
             VALUES (:t, :e, :s, :m)
         """), {"t": snapshot_at, "e": result.endpoint, "s": result.status_code, "m": result.error or "unknown error"})
+
+
+def load_state_observed_at(engine: Engine) -> dict[str, datetime]:
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT state_key, observed_at FROM current_state"))
+        return {str(r.state_key): r.observed_at for r in rows}
+
+
+def refresh_due(
+    state_seen: dict[str, datetime], key: str, now: datetime, every_days: int
+) -> bool:
+    seen = state_seen.get(key)
+    if seen is None:
+        return True
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return now - seen >= timedelta(days=every_days)
+
+
+def load_unlock_counts(engine: Engine) -> dict[str, int]:
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT unlock_type, COUNT(*) AS n
+            FROM unlocks
+            GROUP BY unlock_type
+        """))
+        return {str(r.unlock_type): int(r.n) for r in rows}
+
+
+def currency_metadata_due(engine: Engine, now: datetime, every_days: int) -> bool:
+    with engine.connect() as conn:
+        last = conn.execute(text("SELECT MAX(updated_at) FROM currency_metadata")).scalar()
+    if last is None:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return now - last >= timedelta(days=every_days)
 
 
 def unlock_id(value: Any) -> str | None:
@@ -719,34 +819,73 @@ def store_pvp_matches(engine: Engine, api: GW2Api, observed_at: datetime) -> int
     return len(rows)
 
 
-def store_tp_transactions(engine: Engine, api: GW2Api, observed_at: datetime) -> dict[str, list[dict[str, Any]]]:
+def store_tp_transactions(
+    engine: Engine, api: GW2Api, observed_at: datetime
+) -> tuple[dict[str, list[dict[str, Any]]], int]:
+    """Fetch current TP state and only the new portion of completed history."""
+    known: dict[str, set[int]] = {}
+    with engine.connect() as conn:
+        for side in ("buys", "sells"):
+            rows = conn.execute(text("""
+                SELECT transaction_id FROM tp_transactions
+                WHERE transaction_set='history' AND side=:side
+            """), {"side": side})
+            known[side] = {int(r.transaction_id) for r in rows}
+
+    jobs: dict[tuple[str, str], Any] = {}
     result: dict[str, list[dict[str, Any]]] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for side in ("buys", "sells"):
+            current_path = f"/commerce/transactions/current/{side}"
+            history_path = f"/commerce/transactions/history/{side}"
+            jobs[("current", side)] = pool.submit(api.paginated, current_path)
+            jobs[("history", side)] = pool.submit(
+                api.paginated_until_known, history_path, known[side]
+            )
+
+        for (tx_set, side), future in jobs.items():
+            try:
+                result[f"{tx_set}_{side}"] = future.result()
+            except Exception:
+                result[f"{tx_set}_{side}"] = []
+
+    new_history = 0
     for tx_set in ("current", "history"):
         for side in ("buys", "sells"):
-            path = f"/commerce/transactions/{tx_set}/{side}"
-            try:
-                data = api.paginated(path)
-            except Exception:
-                data = []
-            result[f"{tx_set}_{side}"] = data
-            rows = []
-            for r in data:
-                rows.append({
-                    "id": int(r["id"]),
-                    "side": side,
-                    "set": tx_set,
-                    "item": int(r["item_id"]),
-                    "price": int(r["price"]),
-                    "qty": int(r["quantity"]),
-                    "created": r.get("created"),
-                    "purchased": r.get("purchased"),
-                    "raw": canonical_json(r),
-                })
-            if rows:
-                with engine.begin() as conn:
+            data = result[f"{tx_set}_{side}"]
+            if tx_set == "history":
+                new_history += sum(
+                    1 for r in data
+                    if r.get("id") is not None and int(r["id"]) not in known[side]
+                )
+
+            rows = [{
+                "id": int(r["id"]),
+                "side": side,
+                "set": tx_set,
+                "item": int(r["item_id"]),
+                "price": int(r["price"]),
+                "qty": int(r["quantity"]),
+                "created": r.get("created"),
+                "purchased": r.get("purchased"),
+                "raw": canonical_json(r),
+            } for r in data]
+
+            with engine.begin() as conn:
+                if tx_set == "current":
                     conn.execute(text("""
-                        INSERT INTO tp_transactions(transaction_id, side, transaction_set, item_id, price, quantity, created, purchased, raw_json)
-                        VALUES (:id, :side, :set, :item, :price, :qty, :created, :purchased, CAST(:raw AS JSONB))
+                        DELETE FROM tp_transactions
+                        WHERE transaction_set='current' AND side=:side
+                    """), {"side": side})
+                if rows:
+                    conn.execute(text("""
+                        INSERT INTO tp_transactions(
+                            transaction_id, side, transaction_set, item_id, price, quantity,
+                            created, purchased, raw_json
+                        ) VALUES (
+                            :id, :side, :set, :item, :price, :qty, :created, :purchased,
+                            CAST(:raw AS JSONB)
+                        )
                         ON CONFLICT (transaction_id, side, transaction_set) DO UPDATE SET
                             price=EXCLUDED.price,
                             quantity=EXCLUDED.quantity,
@@ -754,7 +893,17 @@ def store_tp_transactions(engine: Engine, api: GW2Api, observed_at: datetime) ->
                             purchased=EXCLUDED.purchased,
                             raw_json=EXCLUDED.raw_json
                     """), rows)
-    return result
+
+    return result, new_history
+
+
+def get_flip_summary(engine: Engine) -> tuple[int, int]:
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT COUNT(*) AS n, COALESCE(SUM(profit), 0) AS profit
+            FROM matched_flips
+        """)).one()
+    return int(row.n), int(row.profit)
 
 
 def fifo_match(buys: list[dict[str, Any]], sells: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -843,6 +992,9 @@ def wvw_rank_from_account(account: Any, wvw_state: Any) -> int | None:
 def collect_all(engine: Engine, api: GW2Api) -> dict[str, Any]:
     ensure_schema(engine)
     started = observed_at = utcnow()
+    perf_started = time.perf_counter()
+    timings: dict[str, float] = {}
+
     with engine.begin() as conn:
         run_id = conn.execute(text("""
             INSERT INTO job_runs(started_at, status) VALUES (:t, 'running') RETURNING id
@@ -851,89 +1003,180 @@ def collect_all(engine: Engine, api: GW2Api) -> dict[str, Any]:
     ok = 0
     failed = 0
     cache: dict[str, Any] = {}
+    state_seen = load_state_observed_at(engine)
 
-    def fetch(path: str, *, store: bool = False, keep_history: bool = True, **params: Any) -> Any:
+    def handle_result(
+        path: str,
+        res: FetchResult,
+        *,
+        store: bool,
+        keep_history: bool,
+        state_key: str | None = None,
+    ) -> Any:
         nonlocal ok, failed
-        res = api.try_get(path, **params)
         if res.ok:
             ok += 1
             cache[path] = res.data
             if store:
-                store_state(engine, path, res.data, observed_at, keep_history=keep_history)
+                store_state(
+                    engine, state_key or path, res.data, observed_at, keep_history=keep_history
+                )
             return res.data
         failed += 1
         record_error(engine, observed_at, res)
         return None
 
+    def fetch(
+        path: str,
+        *,
+        store: bool = False,
+        keep_history: bool = True,
+        **params: Any,
+    ) -> Any:
+        return handle_result(
+            path,
+            api.try_get(path, **params),
+            store=store,
+            keep_history=keep_history,
+            state_key=path,
+        )
+
+    def fetch_many(specs: list[dict[str, Any]]) -> None:
+        if not specs:
+            return
+        with ThreadPoolExecutor(max_workers=min(MAX_API_WORKERS, len(specs))) as pool:
+            futures = {
+                pool.submit(api.try_get, spec["path"], **spec.get("params", {})): spec
+                for spec in specs
+            }
+            for future in as_completed(futures):
+                spec = futures[future]
+                try:
+                    res = future.result()
+                except Exception as exc:
+                    res = FetchResult(spec["path"], False, error=str(exc))
+                handle_result(
+                    spec["path"],
+                    res,
+                    store=spec.get("store", False),
+                    keep_history=spec.get("keep_history", True),
+                    state_key=spec.get("state_key") or spec["path"],
+                )
+
     try:
-        tokeninfo = fetch("/tokeninfo", store=True, keep_history=False)
-        account = fetch("/account", store=True, keep_history=False) or {}
-        wallet = fetch("/account/wallet", store=True, keep_history=False) or []
-        masteries = fetch("/account/mastery/points", store=True, keep_history=False) or {}
-        characters = fetch("/characters", ids="all") or []
-        pvp_stats = fetch("/pvp/stats", store=True, keep_history=False) or {}
-        luck_data = fetch("/account/luck", store=True, keep_history=False)
-        bank = fetch("/account/bank", store=True, keep_history=False) or []
-        materials = fetch("/account/materials", store=True, keep_history=False) or []
-        shared = fetch("/account/inventory", store=True, keep_history=False) or []
-        legendary = fetch("/account/legendaryarmory", store=True, keep_history=True) or []
+        # 1) Daily dynamic account data. These requests are independent, so fetch them in parallel.
+        t = time.perf_counter()
+        core_specs: list[dict[str, Any]] = [
+            {"path": "/account", "store": True, "keep_history": False},
+            {"path": "/account/wallet", "store": True, "keep_history": False},
+            {"path": "/account/mastery/points", "store": True, "keep_history": False},
+            {"path": "/characters", "params": {"ids": "all"}},
+            {"path": "/pvp/stats", "store": True, "keep_history": False},
+            {"path": "/account/luck", "store": True, "keep_history": False},
+            {"path": "/account/bank", "store": True, "keep_history": False},
+            {"path": "/account/materials", "store": True, "keep_history": False},
+            {"path": "/account/inventory", "store": True, "keep_history": False},
+            {"path": "/account/legendaryarmory", "store": True, "keep_history": True},
+            {"path": "/account/achievements", "store": True, "keep_history": False},
+            {"path": "/commerce/delivery", "store": True, "keep_history": False},
+        ]
+        if refresh_due(state_seen, "/tokeninfo", observed_at, TOKENINFO_REFRESH_DAYS):
+            core_specs.append({"path": "/tokeninfo", "store": True, "keep_history": False})
 
-        # Generic account endpoints: record only distinct states.
-        for path in GENERIC_ACCOUNT_ENDPOINTS:
-            if path in cache:
-                continue
-            fetch(path, store=True, keep_history=True)
+        existing_paths = {spec["path"] for spec in core_specs}
+        for path in DAILY_STATE_ENDPOINTS:
+            if path not in existing_paths:
+                core_specs.append({"path": path, "store": True, "keep_history": True})
+                existing_paths.add(path)
+        for path in WEEKLY_STATE_ENDPOINTS:
+            if path not in existing_paths and refresh_due(state_seen, path, observed_at, 7):
+                core_specs.append({"path": path, "store": True, "keep_history": True})
+                existing_paths.add(path)
 
-        # Unlock collections: one row per unlocked ID, plus current JSON state.
-        unlock_counts: dict[str, int] = {}
+        unlock_due: dict[str, bool] = {}
         for kind, path in UNLOCK_ENDPOINTS.items():
-            if path in cache:
-                data = cache[path]
-            else:
-                data = fetch(path, store=True, keep_history=False)
-            count = upsert_unlocks(engine, kind, data, observed_at)
-            unlock_counts[kind] = count
+            due = refresh_due(state_seen, path, observed_at, UNLOCK_REFRESH_DAYS)
+            unlock_due[kind] = due
+            if due and path not in existing_paths:
+                core_specs.append({"path": path, "store": True, "keep_history": False})
+                existing_paths.add(path)
 
-        # Achievement progress is large: retain current JSON, not a whole duplicate history.
-        achievements = fetch("/account/achievements", store=True, keep_history=False)
+        fetch_many(core_specs)
+        timings["parallel_account_api"] = time.perf_counter() - t
 
-        # Currency metadata is public and changes rarely.
-        upsert_currency_metadata(engine, api, observed_at)
+        account = cache.get("/account") or {}
+        wallet = cache.get("/account/wallet") or []
+        masteries = cache.get("/account/mastery/points") or {}
+        characters = cache.get("/characters") or []
+        pvp_stats = cache.get("/pvp/stats") or {}
+        luck_data = cache.get("/account/luck")
+        bank = cache.get("/account/bank") or []
+        materials = cache.get("/account/materials") or []
+        shared = cache.get("/account/inventory") or []
+        legendary = cache.get("/account/legendaryarmory") or []
+        achievements = cache.get("/account/achievements") or []
+        delivery = cache.get("/commerce/delivery") or {}
+
+        # 2) Small normalized daily snapshots.
+        t = time.perf_counter()
+        unlock_counts = load_unlock_counts(engine)
+        for kind, path in UNLOCK_ENDPOINTS.items():
+            if unlock_due.get(kind) and path in cache:
+                count = upsert_unlocks(engine, kind, cache[path], observed_at)
+                if count or isinstance(cache[path], list):
+                    unlock_counts[kind] = count
+
+        if currency_metadata_due(engine, observed_at, CURRENCY_METADATA_REFRESH_DAYS):
+            upsert_currency_metadata(engine, api, observed_at)
+
         store_wallet(engine, observed_at, wallet)
         mastery_earned, mastery_spent = store_masteries(engine, observed_at, masteries)
-        char_count, total_playtime, total_deaths = store_characters(engine, observed_at, characters)
+        char_count, total_playtime, total_deaths = store_characters(
+            engine, observed_at, characters
+        )
+        timings["normalized_snapshots"] = time.perf_counter() - t
 
-        # Character overview already contains most sub-endpoints. Capture the few
-        # character-specific progression endpoints that are not included there.
+        # 3) Bulky character sub-state is retained, but only refreshed monthly.
+        t = time.perf_counter()
+        detail_specs: list[dict[str, Any]] = []
         for char in characters if isinstance(characters, list) else []:
             if not isinstance(char, dict) or not char.get("name"):
                 continue
             encoded_name = requests.utils.quote(str(char["name"]), safe="")
             for suffix in ("heropoints", "quests", "sab", "dungeons"):
                 path = f"/characters/{encoded_name}/{suffix}"
-                res = api.try_get(path)
-                if res.ok:
-                    ok += 1
-                    store_state(engine, f"character:{char['name']}:{suffix}", res.data, observed_at, keep_history=True)
-                else:
-                    failed += 1
-                    record_error(engine, observed_at, res)
+                state_key = f"character:{char['name']}:{suffix}"
+                if refresh_due(
+                    state_seen, state_key, observed_at, CHARACTER_DETAIL_REFRESH_DAYS
+                ):
+                    detail_specs.append({
+                        "path": path,
+                        "state_key": state_key,
+                        "store": True,
+                        "keep_history": True,
+                    })
+        fetch_many(detail_specs)
+        timings["character_detail_api"] = time.perf_counter() - t
 
-        # PvP matches are event data: insert each match once.
+        # 4) Event streams. PvP is tiny; TP history is incremental after the first run.
+        t = time.perf_counter()
         pvp_matches_seen = store_pvp_matches(engine, api, observed_at)
+        tp, new_history_transactions = store_tp_transactions(engine, api, observed_at)
+        if new_history_transactions:
+            flip_rows, realised_profit = refresh_matched_flips(engine)
+        else:
+            flip_rows, realised_profit = get_flip_summary(engine)
+        timings["events_and_trading"] = time.perf_counter() - t
 
-        # TP transactions and existing FIFO-profit logic.
-        tp = store_tp_transactions(engine, api, observed_at)
-        flip_rows, realised_profit = refresh_matched_flips(engine)
-
-        delivery = fetch("/commerce/delivery", store=True, keep_history=False) or {}
-
-        # Item valuation across current holdings.
+        # 5) Daily wealth valuation. Price batches are fetched concurrently.
+        t = time.perf_counter()
         bank_items = simple_item_stacks(bank)
         material_items = simple_item_stacks(materials)
         shared_items = simple_item_stacks(shared)
         char_items = extract_bag_items(characters)
-        delivery_items = simple_item_stacks(delivery.get("items") if isinstance(delivery, dict) else [])
+        delivery_items = simple_item_stacks(
+            delivery.get("items") if isinstance(delivery, dict) else []
+        )
         all_items = bank_items + material_items + shared_items + char_items + delivery_items
         prices = api.prices([r["id"] for r in all_items])
 
@@ -942,17 +1185,39 @@ def collect_all(engine: Engine, api: GW2Api) -> dict[str, Any]:
         shared_market, shared_liq = value_items(shared_items, prices)
         char_market, char_liq = value_items(char_items, prices)
         delivery_market, delivery_liq = value_items(delivery_items, prices)
-        account_item_market = bank_market + materials_market + shared_market + char_market + delivery_market
-        account_item_liq = bank_liq + materials_liq + shared_liq + char_liq + delivery_liq
+        account_item_market = (
+            bank_market + materials_market + shared_market + char_market + delivery_market
+        )
+        account_item_liq = (
+            bank_liq + materials_liq + shared_liq + char_liq + delivery_liq
+        )
+        timings["price_valuation"] = time.perf_counter() - t
 
-        wallet_map = {int(r["id"]): int(r.get("value") or 0) for r in wallet if isinstance(r, dict) and r.get("id") is not None}
+        wallet_map = {
+            int(r["id"]): int(r.get("value") or 0)
+            for r in wallet
+            if isinstance(r, dict) and r.get("id") is not None
+        }
         liquid_gold = wallet_map.get(1, 0)
         delivery_coins = int(delivery.get("coins") or 0) if isinstance(delivery, dict) else 0
-        buy_order_committed = sum(int(r["price"]) * int(r["quantity"]) for r in tp.get("current_buys", []))
-        sell_order_net = sum(int(int(r["price"]) * int(r["quantity"]) * (1 - TP_TAX)) for r in tp.get("current_sells", []))
-        liquid_net_worth = liquid_gold + delivery_coins + buy_order_committed + sell_order_net + account_item_liq
+        buy_order_committed = sum(
+            int(r["price"]) * int(r["quantity"])
+            for r in tp.get("current_buys", [])
+        )
+        sell_order_net = sum(
+            int(int(r["price"]) * int(r["quantity"]) * (1 - TP_TAX))
+            for r in tp.get("current_sells", [])
+        )
+        liquid_net_worth = (
+            liquid_gold
+            + delivery_coins
+            + buy_order_committed
+            + sell_order_net
+            + account_item_liq
+        )
 
-        # Account headline metrics.
+        # 6) Derived headline metrics. Achievement metadata is cached permanently.
+        t = time.perf_counter()
         pvp_rank, pvp_points, pvp_wins, pvp_losses = pvp_summary(pvp_stats)
         wvw_state = cache.get("/account/wvw")
         wvw_rank = wvw_rank_from_account(account, wvw_state)
@@ -961,10 +1226,16 @@ def collect_all(engine: Engine, api: GW2Api) -> dict[str, Any]:
         achievement_meta = get_achievement_metadata(
             engine,
             api,
-            [a.get("id") for a in achievements if isinstance(a, dict) and a.get("id") is not None] if isinstance(achievements, list) else [],
+            [
+                a.get("id")
+                for a in achievements
+                if isinstance(a, dict) and a.get("id") is not None
+            ] if isinstance(achievements, list) else [],
             observed_at,
         )
-        achievement_points_estimate = calculate_achievement_points(achievements, achievement_meta, daily_ap, monthly_ap)
+        achievement_points_estimate = calculate_achievement_points(
+            achievements, achievement_meta, daily_ap, monthly_ap
+        )
         fractal_level = account.get("fractal_level") if isinstance(account, dict) else None
         luck = None
         if isinstance(luck_data, list) and luck_data and isinstance(luck_data[0], dict):
@@ -975,7 +1246,12 @@ def collect_all(engine: Engine, api: GW2Api) -> dict[str, Any]:
             luck = luck_data
 
         legendary_unique = len(legendary) if isinstance(legendary, list) else 0
-        legendary_count = sum(int(x.get("count") or 0) for x in legendary if isinstance(x, dict)) if isinstance(legendary, list) else 0
+        legendary_count = (
+            sum(int(x.get("count") or 0) for x in legendary if isinstance(x, dict))
+            if isinstance(legendary, list)
+            else 0
+        )
+        timings["derived_metrics"] = time.perf_counter() - t
 
         row = {
             "snapshot_at": observed_at,
@@ -1060,24 +1336,43 @@ def collect_all(engine: Engine, api: GW2Api) -> dict[str, Any]:
             """), row)
 
         finished = utcnow()
+        runtime_seconds = time.perf_counter() - perf_started
+        timings["total"] = runtime_seconds
         with engine.begin() as conn:
             conn.execute(text("""
                 UPDATE job_runs SET finished_at=:f, status='success', endpoints_ok=:ok,
-                    endpoints_failed=:failed, message=:m WHERE id=:id
+                    endpoints_failed=:failed, runtime_seconds=:runtime, message=:m WHERE id=:id
             """), {
                 "f": finished,
                 "ok": ok,
                 "failed": failed,
-                "m": f"Collected account snapshot; {pvp_matches_seen} PvP matches observed; {flip_rows} FIFO flip rows.",
+                "runtime": runtime_seconds,
+                "m": (
+                    f"Daily snapshot; {pvp_matches_seen} PvP matches observed; "
+                    f"{new_history_transactions} new TP history transactions; "
+                    f"{flip_rows} FIFO flip rows."
+                ),
                 "id": run_id,
             })
+        row["_runtime_seconds"] = runtime_seconds
+        row["_timings"] = timings
+        row["_new_tp_history"] = new_history_transactions
         return row
 
     except Exception as exc:
         finished = utcnow()
+        runtime_seconds = time.perf_counter() - perf_started
         with engine.begin() as conn:
             conn.execute(text("""
                 UPDATE job_runs SET finished_at=:f, status='failed', endpoints_ok=:ok,
-                    endpoints_failed=:failed, message=:m WHERE id=:id
-            """), {"f": finished, "ok": ok, "failed": failed, "m": str(exc)[:4000], "id": run_id})
+                    endpoints_failed=:failed, runtime_seconds=:runtime, message=:m WHERE id=:id
+            """), {
+                "f": finished,
+                "ok": ok,
+                "failed": failed,
+                "runtime": runtime_seconds,
+                "m": str(exc)[:4000],
+                "id": run_id,
+            })
         raise
+
